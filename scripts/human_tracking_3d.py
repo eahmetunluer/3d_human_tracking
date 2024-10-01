@@ -28,6 +28,10 @@ latest_color_frame = None
 latest_depth_frame = None
 camera_info = None
 
+# Add these global variables
+current_tracked_id = None
+tracking_lost = True
+
 # Create publishers
 tracked_image_pub = rospy.Publisher('tracked_image', Image, queue_size=10)
 person_position_pub = rospy.Publisher('person_position', PointStamped, queue_size=10)
@@ -202,6 +206,22 @@ def create_point_stamped(x, y, z):
     point_msg.point.z = z
     return point_msg
 
+def get_closest_person(results, depth_frame):
+    closest_distance = float('inf')
+    closest_person = None
+    
+    for result in results[0].boxes:
+        x1, y1, x2, y2 = result.xyxy[0].cpu().numpy().astype(int)
+        tracker_id = int(result.id[0]) if result.id is not None else 0
+        
+        depth = get_median_depth(depth_frame, x1, y1, x2, y2)
+        
+        if depth < closest_distance:
+            closest_distance = depth
+            closest_person = (result, tracker_id, x1, y1, x2, y2)
+    
+    return closest_person
+
 # Dictionary to store PersonTracker objects
 person_trackers = {}
 
@@ -217,9 +237,26 @@ while not rospy.is_shutdown():
         # Perform tracking using YOLOv8
         results = model.track(source=color_frame_gpu, classes=0, persist=True, tracker="bytetrack.yaml")
 
-        for result in results[0].boxes:
-            x1, y1, x2, y2 = result.xyxy[0].cpu().numpy().astype(int)
-            tracker_id = int(result.id[0]) if result.id is not None else 0
+        if tracking_lost:
+            closest_person = get_closest_person(results, latest_depth_frame)
+            if closest_person:
+                result, tracker_id, x1, y1, x2, y2 = closest_person
+                current_tracked_id = tracker_id
+                tracking_lost = False
+        
+        if not tracking_lost and current_tracked_id is not None:
+            tracked_person = None
+            for result in results[0].boxes:
+                if int(result.id[0]) == current_tracked_id:
+                    tracked_person = result
+                    break
+            
+            if tracked_person is None:
+                tracking_lost = True
+                current_tracked_id = None
+                continue
+            
+            x1, y1, x2, y2 = tracked_person.xyxy[0].cpu().numpy().astype(int)
             
             # Get median depth for the tracked person
             depth = get_median_depth(latest_depth_frame, x1, y1, x2, y2)
@@ -230,12 +267,12 @@ while not rospy.is_shutdown():
             x, y, z = pixel_to_3d(center_x, center_y, depth, camera_info)
             
             # Update or create PersonTracker
-            if tracker_id not in person_trackers:
-                person_trackers[tracker_id] = PersonTracker(tracker_id)
-            person_trackers[tracker_id].update(x.item(), y.item(), z.item())
+            if current_tracked_id not in person_trackers:
+                person_trackers[current_tracked_id] = PersonTracker(current_tracked_id)
+            person_trackers[current_tracked_id].update(x.item(), y.item(), z.item())
             
             # Get smoothed position
-            smoothed_position = person_trackers[tracker_id].get_smoothed_position()
+            smoothed_position = person_trackers[current_tracked_id].get_smoothed_position()
             
             if smoothed_position is not None:
                 # Publish smoothed 3D position
@@ -243,7 +280,7 @@ while not rospy.is_shutdown():
                 person_position_pub.publish(point_msg)
                 
                 # Publish marker for RViz
-                marker = create_person_marker(smoothed_position[0], smoothed_position[1], smoothed_position[2], tracker_id)
+                marker = create_person_marker(smoothed_position[0], smoothed_position[1], smoothed_position[2], current_tracked_id)
                 person_marker_pub.publish(marker)
 
         # Publish camera marker
